@@ -1,0 +1,182 @@
+USE Shop
+
+DROP TABLE Goods
+CREATE TABLE Goods
+(
+	GoodId INT PRIMARY KEY IDENTITY,
+	GoodName NVARCHAR(MAX) NOT NULL,
+	GoodWeight FLOAT NULL,
+	Price MONEY NOT NULL
+)
+
+DROP TABLE Staffs
+CREATE TABLE Staffs
+(
+	StaffId INT PRIMARY KEY IDENTITY,
+	StaffName NVARCHAR(MAX) NOT NULL,
+	StaffSurname NVARCHAR(MAX) NOT NULL,
+	StaffSex CHAR NOT NULL,
+	StaffPosition NVARCHAR(MAX) NOT NULL,
+	StaffSalary MONEY NOT NULL,
+	StaffBirth DATE NOT NULL,
+	StaffExper INT NOT NULL
+)
+
+DROP TABLE Customers
+CREATE TABLE Customers
+(
+	CustId INT PRIMARY KEY IDENTITY,
+	CustName NVARCHAR(MAX) NOT NULL,
+	CustSurname NVARCHAR(MAX) NOT NULL,
+	CustSex CHAR NOT NULL,
+	CustBirth DATE NOT NULL,
+	DiscountCard NVARCHAR(100) UNIQUE
+)
+
+DROP TABLE Purchases
+CREATE TABLE Purchases
+(
+	PurchId INT PRIMARY KEY IDENTITY,
+	PurchDate DATETIME NOT NULL,
+	StaffId INT NOT NULL,
+	CustId INT NOT NULL,
+	FOREIGN KEY (StaffId) REFERENCES Staffs(StaffId) ON DELETE CASCADE,
+	FOREIGN KEY (CustId) REFERENCES Customers(CustId) ON DELETE CASCADE
+)
+
+DROP TABLE GoodsList
+CREATE TABLE GoodsList 
+(
+	PurchId INT NOT NULL,
+	GoodId INT NOT NULL,
+	GoodsCount INT NOT NULL,
+	PRIMARY KEY (PurchId, GoodId, GoodsCount),
+	FOREIGN KEY (PurchId) REFERENCES Purchases(PurchId) ON DELETE CASCADE,
+	FOREIGN KEY (GoodId) REFERENCES Goods(GoodId) ON DELETE CASCADE,
+)
+
+/*Обмеження на бд*/
+ALTER TABLE Goods
+ADD CONSTRAINT CHECK_PRICE
+CHECK (Price >= 1.00 AND Price <= 12000)
+
+ALTER TABLE Staffs
+ADD CONSTRAINT CHECK_SEX_STAFF
+CHECK (StaffSex = 'M' OR StaffSex = 'F')
+
+ALTER TABLE Staffs
+ADD CONSTRAINT CHECK_SALARY
+CHECK (StaffSalary >= 3000 AND StaffSalary <= 20000)
+
+ALTER TABLE Staffs
+ADD CONSTRAINT CHECK_POSITION
+CHECK (StaffPosition = 'Seller' OR StaffPosition = 'Consultant' OR StaffPosition = 'Cleaner' OR StaffPosition = 'Admin' OR StaffPosition = 'Director' OR StaffPosition = 'loader')
+
+ALTER TABLE Staffs
+ADD CONSTRAINT CHECK_BIRTH_STAFF
+CHECK (StaffBirth BETWEEN DATEADD(YEAR, -45, CAST(SYSDATETIME() AS DATE)) AND DATEADD(YEAR, -18, CAST(SYSDATETIME() AS DATE)))
+
+ALTER TABLE Customers
+ADD CONSTRAINT CHECK_SEX_CUSTM
+CHECK (CustSex = 'M' OR CustSex = 'F')
+
+ALTER TABLE Customers
+ADD CONSTRAINT CHECK_DISCOUNT_CARD
+CHECK (DiscountCard LIKE '^[0-9]{3}[a-z]{5}')
+
+ALTER TABLE Customers
+ADD CONSTRAINT CHECK_BIRTH
+CHECK (CustBirth BETWEEN DATEADD(YEAR, -45, CAST(SYSDATETIME() AS DATE)) AND DATEADD(YEAR, -18, CAST(SYSDATETIME() AS DATE)))
+
+/*тригер, що перевіряє чи менший досвід робітника на певну кількість років від його року народження*/
+CREATE TRIGGER DIFF_BIRTH_EXPER
+ON Staffs
+AFTER INSERT, UPDATE
+AS 
+IF EXISTS (SELECT * FROM inserted
+		   WHERE inserted.StaffExper > (YEAR(CAST(SYSDATETIME() AS DATE)) - YEAR(inserted.StaffBirth) - YEAR('01-01-0018')))
+BEGIN
+	ROLLBACK TRANSACTION
+END
+
+CREATE TRIGGER CHECK_PURCH
+ON Purchases
+AFTER INSERT, UPDATE
+AS
+IF EXISTS (SELECT * FROM inserted INNER JOIN Staffs ON inserted.StaffId = Staffs.StaffId
+		   WHERE Staffs.StaffPosition <> 'Seller')
+BEGIN
+	ROLLBACK TRANSACTION
+END
+
+/*функція для додавання поля в таблицю пвд для товару*/
+DROP FUNCTION PVD
+CREATE FUNCTION PDV(@Id INT)
+RETURNS MONEY
+BEGIN
+	DECLARE @RES MONEY
+	SET @RES = (SELECT Price FROM Goods WHERE GoodId = @Id) * 0.1
+	RETURN @RES
+END
+
+ALTER TABLE Goods
+ADD Pvd AS dbo.PDV(GoodId)
+
+CREATE OR ALTER FUNCTION PURCH_SUM(@Id INT)
+RETURNS MONEY
+BEGIN
+	DECLARE @SUM MONEY
+	DECLARE @T TABLE(GoodSum MONEY)
+	INSERT @T SELECT Goods.Price * GoodsList.GoodsCount AS GoodSum 
+			  FROM GoodsList INNER JOIN Goods ON
+			  GoodsList.GoodId = Goods.GoodId
+			  WHERE PurchId = @Id
+	SET @SUM = (SELECT SUM(GoodSum) FROM @T)
+	RETURN @SUM
+END
+
+ALTER TABLE Purchases
+ADD PurchSum AS dbo.PURCH_SUM(PurchId)
+
+/*повертає к-сть покупок певного клієнта*/
+CREATE FUNCTION COUNT_PURCHASES(@CustId INT)
+RETURNS INT
+BEGIN
+	DECLARE @COUNT INT
+	SET @COUNT = (SELECT COUNT(PurchId) FROM Purchases WHERE CustId = @CustId)
+	RETURN @COUNT
+END
+
+/*процедура, яка додає або віднімає до певної суми зарплати певну кількість грошей*/
+CREATE OR ALTER PROC CHANGE_SALARY
+@THIS_SALARY MONEY, @DIFF MONEY
+AS
+BEGIN
+	DECLARE @CUR INT
+	IF EXISTS (SELECT * FROM Staffs WHERE StaffSalary = @THIS_SALARY)
+	BEGIN
+		DECLARE SALARYCURSOR CURSOR FOR
+		(SELECT StaffId FROM Staffs WHERE StaffSalary = @THIS_SALARY)
+		OPEN SALARYCURSOR
+			FETCH NEXT FROM SALARYCURSOR INTO @CUR
+			WHILE @@FETCH_STATUS = 0
+			BEGIN
+				UPDATE Staffs SET StaffSalary = StaffSalary + @DIFF WHERE StaffId = @CUR
+				FETCH NEXT FROM SALARYCURSOR INTO @CUR
+			END
+		CLOSE SALARYCURSOR
+	END
+END
+
+/*при видалені всіх покупок певного клієнта, видаляється сам клієнт*/
+CREATE TRIGGER DEL_CUST
+ON Purchases
+FOR DELETE
+AS
+	DECLARE @CustId INT 
+	SET @CustId = (SELECT deleted.PurchId FROM deleted)
+	DELETE Purchases WHERE PurchId = (SELECT deleted.PurchId FROM deleted)
+	IF NOT EXISTS (SELECT CustId FROM Purchases)
+	BEGIN
+		DELETE Customers WHERE CustId = @CustId
+	END
